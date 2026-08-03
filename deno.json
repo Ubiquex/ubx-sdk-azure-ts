@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "@ubx/sdk": "jsr:@ubx/sdk@^0.1.0"
+  }
+}

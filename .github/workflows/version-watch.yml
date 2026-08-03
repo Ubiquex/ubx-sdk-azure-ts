@@ -1,0 +1,178 @@
+name: version-watch
+
+# Weekly check against the real Terraform Registry provider-versions API
+# for a newer hashicorp/azurerm release. On a newer version: bumps
+# VERSION, re-runs `ubx sdk gen --lang ts --out .` against it, and opens
+# a PR with the diff for review. Never auto-merges (UBI-99/104/109/112).
+#
+# Ported from ubx-sdk-kubernetes-ts's own proven version-watch.yml -- same
+# registry-call shape (just a different provider), same $RUNNER_TEMP
+# scratch-isolation. `@ubx/sdk` (the shared TS runtime) is a real
+# published dependency -- jsr:@ubx/sdk (UBI-110/113) -- this repo was
+# born directly on it, no vendoring stopgap ever existed here. deno.json/
+# deno.lock are hand/tooling-maintained, not codegen output, so they're
+# excluded from the regeneration diff.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # every Monday, 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out ubx-sdk-azure-ts
+        uses: actions/checkout@v4
+
+      - name: Query Terraform Registry for the latest hashicorp/azurerm version
+        id: registry
+        run: |
+          set -euo pipefail
+          # Confirmed real API (HashiCorp's own docs, same shape as
+          # hashicorp/aws's/hashicorp/google's -- UBI-99/108): no auth
+          # needed.
+          response="$(curl -sf https://registry.terraform.io/v1/providers/hashicorp/azurerm/versions)"
+          latest="$(echo "$response" | jq -r '.versions[].version' | sort -V | tail -1)"
+          if [ -z "$latest" ]; then
+            echo "registry query returned no versions -- failing loudly rather than silently no-op'ing" >&2
+            exit 1
+          fi
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Terraform Registry reports latest hashicorp/azurerm version: $latest"
+          # Known, accepted limitation for v1 (UBI-99): `sort -V` on
+          # semver strings is usually correct but not bulletproof against
+          # pre-release tags. Fine for v1; harden if HashiCorp ever ships
+          # a pre-release that trips this.
+
+      - name: Compare against this repo's pinned version
+        id: compare
+        run: |
+          set -euo pipefail
+          current="$(cat VERSION)"
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "This repo was last generated from: $current"
+          if [ "$current" = "${{ steps.registry.outputs.latest }}" ]; then
+            echo "newer=false" >> "$GITHUB_OUTPUT"
+            echo "Already current -- nothing to do."
+          else
+            echo "newer=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # --- everything below only runs when a newer version was found ---
+
+      - name: Check out ubiquex (to build ubx from source)
+        if: steps.compare.outputs.newer == 'true'
+        run: |
+          set -euo pipefail
+          # Plain `git clone` into $RUNNER_TEMP -- deliberately OUTSIDE
+          # this repo's own checkout (which doubles as $GITHUB_WORKSPACE).
+          # ubx-sdk-aws-go's own first live run generated into a scratch
+          # dir INSIDE the repo checkout; `rsync --delete`'s destination
+          # scan then treated its own still-being-read source as
+          # extraneous destination content and deleted it mid-transfer
+          # ("file has vanished", rsync exit 24). Keeping every scratch
+          # path under $RUNNER_TEMP makes that class of source/destination
+          # overlap structurally impossible.
+          #
+          # Fine-grained PAT, contents:read only on Ubiquex/ubiquex.
+          # Needed because ubiquex is private and the default
+          # GITHUB_TOKEN here is scoped to this repo
+          # (ubx-sdk-azure-ts) only.
+          git clone --depth=1 \
+            "https://x-access-token:${{ secrets.UBIQUEX_SOURCE_TOKEN }}@github.com/Ubiquex/ubiquex.git" \
+            "${{ runner.temp }}/ubiquex-src"
+
+      - name: Set up Go
+        if: steps.compare.outputs.newer == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ runner.temp }}/ubiquex-src/go.mod
+
+      - name: Set up Deno
+        if: steps.compare.outputs.newer == 'true'
+        uses: denoland/setup-deno@v2.0.5
+        with:
+          deno-version: "2.x"
+
+      - name: Build ubx
+        if: steps.compare.outputs.newer == 'true'
+        run: |
+          set -euo pipefail
+          # Built from ubiquex's own `main` HEAD, not a tagged release --
+          # no release cadence yet that tracks feature landings. Accepted
+          # tradeoff for v1. (`-C` must be the FIRST flag to `go build`.)
+          go build -C "${{ runner.temp }}/ubiquex-src" -o "${{ runner.temp }}/ubx" ./cmd/ubx
+          "${{ runner.temp }}/ubx" version
+
+      - name: Regenerate bindings
+        if: steps.compare.outputs.newer == 'true'
+        run: |
+          set -euo pipefail
+          gendir="${{ runner.temp }}/ubxgen"
+          mkdir -p "$gendir/.ubx"
+          cat > "$gendir/.ubx/config.hcl" <<EOF
+          providers = {
+            "hashicorp/azurerm" = "${{ steps.registry.outputs.latest }}"
+          }
+          EOF
+          # `ubx sdk gen` is schema-only: no Configure, no credentials
+          # needed (confirmed by its own --help text, and by this job
+          # never setting any ARM_*/Azure credential at all).
+          ( cd "$gendir" && "${{ runner.temp }}/ubx" sdk gen --lang ts --out out )
+          # `--out` writes a repo-shaped tree under <out>/<lang>/<source>;
+          # flatten it back to this repo's own root, matching the initial
+          # commit's own layout (package.json, azurerm/ namespace
+          # directory per UBI-106, at the repo root). deno.json/deno.lock
+          # are excluded deliberately: `ubx sdk gen` never generates
+          # either (this repo's own @ubx/sdk import map and its
+          # resolved-version lock are hand/tooling-maintained, not
+          # codegen output) -- without this exclusion, rsync --delete
+          # would silently wipe both every run.
+          rsync -a --delete \
+            --exclude='.git' --exclude='.github' --exclude='VERSION' --exclude='README.md' \
+            --exclude='deno.json' --exclude='deno.lock' \
+            "$gendir/out/ts/hashicorp-azurerm/" ./
+          echo "${{ steps.registry.outputs.latest }}" > VERSION
+
+      - name: Sanity-check the regenerated tree still typechecks
+        if: steps.compare.outputs.newer == 'true'
+        run: |
+          set -euo pipefail
+          # `@ubx/sdk` is a real jsr: dependency (UBI-110) -- `--no-remote`
+          # structurally refuses to resolve ANY remote specifier
+          # (jsr:/https:), cache or lockfile notwithstanding (UBI-110's
+          # own confirmed finding), so it can never pass against a jsr:
+          # import map. `deno cache` (network, warms the lockfile/module
+          # cache) followed by `deno check --frozen` (cache-only from
+          # here; fails if the lockfile would need to change) is the real
+          # offline-safe equivalent.
+          find . -name "*.ts" -print0 | xargs -0 deno cache
+          find . -name "*.ts" -print0 | xargs -0 deno check --frozen
+
+      - name: Open PR
+        if: steps.compare.outputs.newer == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "ubx-bot"
+          git config user.email "actions@users.noreply.github.com"
+          branch="sdk-regen/hashicorp-azurerm-${{ steps.registry.outputs.latest }}"
+          git checkout -b "$branch"
+          git add -A
+          git commit -m "sdk: regenerate from hashicorp/azurerm@${{ steps.registry.outputs.latest }}"
+          git push origin "$branch" --force
+          gh pr create \
+            --title "sdk: regenerate from hashicorp/azurerm@${{ steps.registry.outputs.latest }}" \
+            --body "Automated regeneration (\`.github/workflows/version-watch.yml\`) triggered by a newer \`hashicorp/azurerm\` version on the Terraform Registry.
+
+          Previous: \`${{ steps.compare.outputs.current }}\`
+          New: \`${{ steps.registry.outputs.latest }}\`
+
+          New files = new service. Modified files = an existing resource's schema changed. This never auto-merges -- review the diff before merging." \
+            --base main --head "$branch"
