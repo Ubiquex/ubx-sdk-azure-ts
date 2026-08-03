@@ -137,6 +137,19 @@ jobs:
             --exclude='.git' --exclude='.github' --exclude='VERSION' --exclude='README.md' \
             --exclude='deno.json' --exclude='deno.lock' \
             "$gendir/out/ts/hashicorp-azurerm/" ./
+          # package.json's "name" is NOT excluded above (its "description"
+          # needs the version bump like doc.ts's own stamp does) -- but
+          # `ubx sdk gen`'s shortName is derived mechanically from the
+          # provider source ("hashicorp/azurerm" -> "azurerm"), so every
+          # regen writes "@ubx/sdk-azurerm" there, silently overwriting
+          # this repo's real published name, "@ubx/sdk-azure" (matching
+          # the repo's own name, ubx-sdk-azure-ts -- Azure is the first
+          # provider in this family whose repo shortname, "azure",
+          # diverges from its mechanically-derived shortname, "azurerm";
+          # go.mod's module path needed the identical correction in
+          # UBI-115's sibling Go repo). Corrected back in place every
+          # run, same as go.mod's module-path fix.
+          sed -i 's/"@ubx\/sdk-azurerm"/"@ubx\/sdk-azure"/' package.json
           echo "${{ steps.registry.outputs.latest }}" > VERSION
 
       - name: Sanity-check the regenerated tree still typechecks
